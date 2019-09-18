@@ -17,6 +17,7 @@ package com.google.android.exoplayer2.ext.ima;
 
 import android.content.Context;
 import android.net.Uri;
+import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import androidx.annotation.IntDef;
@@ -388,6 +389,11 @@ public final class ImaAdsLoader
   private long pendingContentPositionMs;
   /** Whether {@link #getContentProgress()} has sent {@link #pendingContentPositionMs} to IMA. */
   private boolean sentPendingContentPositionMs;
+  /**
+   * Handler to delay ad loading errors to prevent hanging the player when all ads in a group fail
+   */
+  private Handler imaErrorHandler = new Handler(Looper.getMainLooper());
+
 
   /**
    * Creates a new IMA ads loader.
@@ -1097,6 +1103,7 @@ public final class ImaAdsLoader
     Ad ad = adEvent.getAd();
     switch (adEvent.getType()) {
       case LOADED:
+        cancelPendingAdGroupLoadError();
         // The ad position is not always accurate when using preloading. See [Internal: b/62613240].
         AdPodInfo adPodInfo = ad.getAdPodInfo();
         int podIndex = adPodInfo.getPodIndex();
@@ -1157,7 +1164,14 @@ public final class ImaAdsLoader
         }
         break;
       case STARTED:
+        break;
       case ALL_ADS_COMPLETED:
+        cancelPendingAdGroupLoadError();
+        // force the player to continue player when IMA says there are no ads left
+        adPlaybackState = new AdPlaybackState();
+        updateAdPlaybackState();
+        checkForContentComplete();
+        break;
       default:
         break;
     }
@@ -1224,13 +1238,31 @@ public final class ImaAdsLoader
     }
   }
 
+  private void cancelPendingAdGroupLoadError() {
+    if (DEBUG) {
+      Log.d(TAG, "cancelPendingAdGroupLoadError");
+    }
+    imaErrorHandler.removeCallbacksAndMessages(null);
+  }
+
   private void handleAdGroupLoadError(Exception error) {
-    int adGroupIndex =
-        this.adGroupIndex == C.INDEX_UNSET ? expectedAdGroupIndex : this.adGroupIndex;
+    int adGroupIndex = this.adGroupIndex == C.INDEX_UNSET ? expectedAdGroupIndex : this.adGroupIndex;
+
     if (adGroupIndex == C.INDEX_UNSET) {
       // Drop the error, as we don't know which ad group it relates to.
       return;
     }
+
+    // the group index was not known, but guessed from the expectedAdGroupIndex
+    if (this.adGroupIndex == C.INDEX_UNSET) {
+      // delay this error, a LOAD may come in for this group and we don't want to mark the ad group as failed
+      imaErrorHandler.postDelayed(() -> handleAdGroupLoadError(error, adGroupIndex), 5000);
+    } else {
+      handleAdGroupLoadError(error, adGroupIndex);
+    }
+  }
+
+  private void handleAdGroupLoadError(Exception error, int adGroupIndex) {
     AdPlaybackState.AdGroup adGroup = adPlaybackState.adGroups[adGroupIndex];
     if (adGroup.count == C.LENGTH_UNSET) {
       adPlaybackState =
